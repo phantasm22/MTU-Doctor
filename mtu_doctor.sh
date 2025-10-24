@@ -1,0 +1,601 @@
+#!/bin/sh
+# ====================================================
+# MTU Doctor for GL.iNet Routers
+# Author: phantasm22
+# License: GPL-3.0
+# Version: 2025-10-24
+#
+# This script optimizes and manages MTU settings on GL.iNet routers, ensuring
+# reliable network and VPN performance. It provides tools to detect optimal MTU
+# values, display interface settings, and diagnose network connectivity with
+# support for OpenVPN and WireGuard interfaces (server and client).
+#
+# It supports:
+# - Detecting optimal MTU for WAN, WireGuard, OpenVPN server, and VPN clients
+# - Checking for active VPN clients before MTU detection
+# - Displaying current MTU settings with optional full interface list
+# - Comprehensive network diagnostics with link speed and VPN status
+# - Updating MTU settings in runtime and GL.iNet web UI (UCI)
+# - Setting custom MTU values for specific interfaces, including VLANs
+# - BusyBox-compatible operation for GL.iNet routers
+# ====================================================
+
+# -----------------------------
+# Color & Splash
+# -----------------------------
+RESET="\033[0m"
+CYAN="\033[96m"      # Bright cyan for headers and MTU
+GREEN="\033[1;92m"   # Bright green for UP status and success
+RED="\033[31m"       # Red for DOWN status and errors
+YELLOW="\033[33m"    # Yellow for Speed and IPs
+MAGENTA="\033[1;35m" # Bright magenta for emphasis
+
+SPLASH="
+   _____ _          _ _   _      _   
+  / ____| |        (_) \\ | |    | |  
+ | |  __| |  ______ _|  \\| | ___| |_ 
+ | | |_ | | |______| | . \` |/ _ \\ __|
+ | |__| | |____    | | |\\  |  __/ |_ 
+  \\_____|______|   |_|_| \\_|\\___|\\__|
+
+         MTU Doctor for GL.iNet
+"
+
+# Cleanup function for Ctrl+C or termination
+cleanup() {
+    rm -f "/tmp/ping_result_$$" 2>/dev/null
+    exit 0
+}
+
+# Trap SIGINT and SIGTERM to ensure cleanup
+trap cleanup INT TERM
+
+# Interface discovery (GL.iNet-specific)
+WAN_IF=$(ip route | grep default | awk '{print $5}' | head -n 1)
+WG_IF=$(ip link show | grep -o 'wgserver' || echo 'wgserver')
+OVPN_IF=$(ip link show | grep -o 'ovpnserver' || echo 'ovpnserver')
+
+# Helpers
+get_mtu() { ip link show "$1" 2>/dev/null | grep -w mtu | awk '{print $5}'; }
+get_state() { ip link show "$1" 2>/dev/null | grep -q "UP" && echo "UP" || echo "DOWN"; }
+get_speed() {
+    IFACE="$1"
+    case "$IFACE" in
+        eth*|br-lan)
+            if [ -f "/sys/class/net/$IFACE/speed" ]; then
+                SPEED=$(cat "/sys/class/net/$IFACE/speed" 2>/dev/null)
+                [ -n "$SPEED" ] && echo "${SPEED}Mbit/s" || echo "Unknown"
+            else
+                echo "Unknown"
+            fi
+            ;;
+        *) echo "N/A" ;;
+    esac
+}
+
+# Function to get max IP from subnet
+get_subnet_range() {
+    local vpn_type=$1
+    local start_ip=$2
+    local max_ip=""
+    if [ "$vpn_type" = "openvpn" ]; then
+        subnet=$(uci get ovpnserver.vpn.server 2>/dev/null | cut -d' ' -f1)
+        max_clients=$(uci get ovpnserver.vpn.max-clients 2>/dev/null)
+        if [ -n "$subnet" ]; then
+            max_ip=$(echo "$subnet" | awk -F'[./]' '{print $1"."$2"."$3"."$4+255-$4}')
+            if [ -n "$max_clients" ]; then
+                max_num=$(( $(echo "$start_ip" | cut -d'.' -f4) + $max_clients - 1 ))
+                max_ip=$(echo "$start_ip" | cut -d'.' -f1-3)".$max_num"
+            fi
+        else
+            max_ip=$(echo "$start_ip" | cut -d'.' -f1-3)".254"
+        fi
+    elif [ "$vpn_type" = "wireguard" ]; then
+        subnet=$(uci show network | grep -E 'addresses.*10.1.0.' | grep -o '10.1.0.[0-9]+/[0-9]+' | head -n 1)
+        if [ -n "$subnet" ]; then
+            mask=$(echo "$subnet" | cut -d'/' -f2)
+            if [ "$mask" = "24" ]; then
+                max_ip=$(echo "$start_ip" | cut -d'.' -f1-3)".254"
+            else
+                max_num=$(( $(echo "$start_ip" | cut -d'.' -f4) + (1 << (32 - $mask)) - 2 ))
+                max_ip=$(echo "$start_ip" | cut -d'.' -f1-3)".$max_num"
+            fi
+        else
+            max_ip=$(echo "$start_ip" | cut -d'.' -f1-3)".254"
+        fi
+    fi
+    echo "$max_ip"
+}
+
+# Function to detect active VPN client
+detect_vpn_client() {
+    local interface=$1
+    local start_ip=$2
+    local vpn_type=$3
+    local quiet=$4
+    local subnet_prefix=$(echo "$start_ip" | cut -d'.' -f1-3)
+    local max_ip=$(get_subnet_range "$vpn_type" "$start_ip")
+    local max_num=$(echo "$max_ip" | cut -d'.' -f4)
+    local active_ip=""
+    local tmpfile="/tmp/ping_result_$$"
+
+    # Check if interface is routable
+    if ! ip route show dev "$interface" >/dev/null 2>&1; then
+        [ "$quiet" != "yes" ] && printf "${YELLOW}%s not routable. Using default IP: %s${RESET}\n" "$interface" "$start_ip" >&2
+        echo "$start_ip:unresponsive"
+        return
+    fi
+
+    rm -f "$tmpfile"
+
+    # Serially ping first 10 IPs (2-11)
+    [ "$quiet" != "yes" ] && printf "${MAGENTA}Scanning for active %s client (.2-.11)...${RESET}\n" "$vpn_type" >&2
+    for i in $(seq 2 11); do
+        ip="$subnet_prefix.$i"
+        if ping -I "$interface" -c 1 -W 1 -s 949 "$ip" >/dev/null 2>&1; then
+            active_ip="$ip"
+            break
+        fi
+    done
+
+    # If no response, ping remaining IPs in parallel
+    if [ -z "$active_ip" ]; then
+        [ "$quiet" != "yes" ] && printf "${MAGENTA}No client found in .2-.11, scanning .12-.%d...${RESET}\n" "$max_num" >&2
+        for i in $(seq 12 "$max_num"); do
+            ip="$subnet_prefix.$i"
+            ping -I "$interface" -c 1 -W 1 -s 949 "$ip" >/dev/null 2>&1 && echo "$ip" >> "$tmpfile" &
+        done
+        wait
+        if [ -s "$tmpfile" ]; then
+            active_ip=$(head -n 1 "$tmpfile")
+        fi
+    fi
+
+    rm -f "$tmpfile" 2>/dev/null
+
+    if [ -n "$active_ip" ]; then
+        echo "$active_ip"
+    else
+        [ "$quiet" != "yes" ] && printf "${YELLOW}No %s client found${RESET}\n" "$vpn_type" >&2
+        echo "$start_ip:unresponsive"
+    fi
+}
+
+# Function to test MTU to VPN client
+test_mtu_vpn() {
+    local interface=$1
+    local ip=$2
+    local vpn_type=$3
+    local max_mtu=1400
+    local overhead=0
+    [ "$vpn_type" = "openvpn" ] && overhead=72
+    [ "$vpn_type" = "wireguard" ] && overhead=80
+    local highest_mtu=0
+
+    printf "${MAGENTA}Testing MTU to %s on %s...${RESET}\n" "$ip" "$interface" >&2
+    for mtu in $(seq 1280 10 $max_mtu); do
+        packet_size=$((mtu - 28 - overhead))
+        ping -I "$interface" -c 1 -W 1 -s "$packet_size" "$ip" >/dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            highest_mtu=$mtu
+        else
+            break
+        fi
+    done
+
+    if [ $highest_mtu -eq 0 ]; then
+        printf "${YELLOW}No MTU succeeded. Using standard MTU: 1420${RESET}\n" >&2
+        highest_mtu=1420
+    else
+        printf "${GREEN}Highest working MTU: %d${RESET}\n" "$highest_mtu" >&2
+        if [ $highest_mtu -ne 1420 ]; then
+            printf "${YELLOW}Warning: MTU differs from standard 1420${RESET}\n" >&2
+        fi
+    fi
+    echo "$highest_mtu"
+}
+
+# list_interfaces: Displays network interfaces with their status, MTU, and optionally speed,
+# or a numbered list for manual selection. Supports filtering for specific interfaces
+# (eth*, br-lan, ovpnserver, wgserver) and excluding loopback (lo).
+list_interfaces() {
+    SHOW_SPEED="$1"
+    FILTER="$2"
+    FILTER_LO="$3"
+    NUMBERED="$4"
+    INTERFACES=""
+    COUNT=0
+    printf "${CYAN}Interfaces and MTUs:${RESET}\n"
+    for IF in $(ls /sys/class/net); do
+        [ -z "$(ip link show "$IF" 2>/dev/null)" ] && continue
+        if [ "$FILTER" = "yes" ]; then
+            case "$IF" in
+                eth*|br-lan|ovpnserver|wgserver) ;;
+                *) continue ;;
+            esac
+        fi
+        [ "$FILTER_LO" = "yes" ] && [ "$IF" = "lo" ] && continue
+        COUNT=$((COUNT + 1))
+        INTERFACES="$INTERFACES $IF"
+        if [ "$NUMBERED" = "yes" ]; then
+            printf "  %d) %s\n" "$COUNT" "$IF"
+        else
+            STATE=$(get_state "$IF")
+            MTU=$(get_mtu "$IF")
+            SPEED=$(get_speed "$IF")
+            STATE_COLOR=$( [ "$STATE" = "UP" ] && echo "${GREEN}UP${RESET}" || echo "${RED}DOWN${RESET}" )
+            MTU_COLOR="${CYAN}${MTU:-unknown}${RESET}"
+            SPEED_COLOR="${YELLOW}${SPEED:-Unknown}${RESET}"
+            if [ "$SHOW_SPEED" = "yes" ]; then
+                printf "  • %-10s (%b) - MTU: %b, Speed: %b\n" "$IF" "$STATE_COLOR" "$MTU_COLOR" "$SPEED_COLOR"
+            else
+                printf "  • %-10s (%b) - MTU: %b\n" "$IF" "$STATE_COLOR" "$MTU_COLOR"
+            fi
+        fi
+    done
+}
+
+# apply_mtu: Sets MTU for an interface, updating runtime and UCI for GL.iNet web UI.
+apply_mtu() {
+    IFACE="$1"; VALUE="$2"
+    
+    if ip link set "$IFACE" mtu "$VALUE" 2>/dev/null; then
+        printf "${GREEN}MTU on %s set to %s${RESET}\n" "$IFACE" "$VALUE"
+    else
+        printf "${RED}Failed to set MTU on %s to %s${RESET}\n" "$IFACE" "$VALUE"
+        return
+    fi
+    
+    case "$IFACE" in
+        ovpnserver)
+            uci set ovpnserver.global.mtu="$VALUE"
+            uci commit ovpnserver
+            /etc/init.d/openvpn restart 2>/dev/null
+            printf "${GREEN}✓ OpenVPN UI: ovpnserver.global.mtu='%s'${RESET}\n" "$VALUE"
+            ;;
+        wgserver)
+            uci set wireguard_server.main_server.mtu="$VALUE"
+            uci commit wireguard_server
+            ifdown "$IFACE" 2>/dev/null
+            ifup "$IFACE" 2>/dev/null
+            printf "${GREEN}✓ WireGuard UI: wireguard_server.main_server.mtu='%s'${RESET}\n" "$VALUE"
+            ;;
+        wg0)
+            uci set wireguard_client."$IFACE".mtu="$VALUE" 2>/dev/null || printf "${YELLOW}⚠️ No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$IFACE"
+            uci commit wireguard_client
+            /etc/init.d/wireguard restart 2>/dev/null
+            printf "${GREEN}✓ WireGuard Client UI: wireguard_client.%s.mtu='%s'${RESET}\n" "$IFACE" "$VALUE"
+            ;;
+        tun0)
+            uci set ovpnclient.global.mtu="$VALUE" 2>/dev/null || printf "${YELLOW}⚠️ No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$IFACE"
+            uci commit ovpnclient
+            /etc/init.d/openvpn restart 2>/dev/null
+            printf "${GREEN}✓ OpenVPN Client UI: ovpnclient.global.mtu='%s'${RESET}\n" "$IFACE" "$VALUE"
+            ;;
+        *)
+            if echo "$IFACE" | grep -q "\."; then
+                UCI_SECTION=$(uci show network | grep "ifname=.*$IFACE" | cut -d'.' -f2)
+                if [ -n "$UCI_SECTION" ]; then
+                    uci set network."$UCI_SECTION".mtu="$VALUE"
+                    uci commit network
+                    ifdown "$UCI_SECTION" 2>/dev/null
+                    ifup "$UCI_SECTION" 2>/dev/null
+                    printf "${GREEN}✓ Network UI: network.%s.mtu='%s'${RESET}\n" "$UCI_SECTION" "$VALUE"
+                else
+                    printf "${YELLOW}⚠️ No UCI mapping found for %s, MTU set at runtime only${RESET}\n" "$IFACE"
+                fi
+            else
+                uci set network."$IFACE".mtu="$VALUE" 2>/dev/null
+                if [ $? -eq 0 ]; then
+                    uci commit network
+                    ifdown "$IFACE" 2>/dev/null
+                    ifup "$IFACE" 2>/dev/null
+                    printf "${GREEN}✓ Network UI: network.%s.mtu='%s'${RESET}\n" "$IFACE" "$VALUE"
+                else
+                    printf "${YELLOW}⚠️ No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$IFACE"
+                fi
+            fi
+            ;;
+    esac
+    
+    sleep 2
+    ACTUAL=$(get_mtu "$IFACE")
+    for i in 1 2 3 4 5; do
+        [ -n "$ACTUAL" ] && break
+        sleep 2
+        ACTUAL=$(get_mtu "$IFACE")
+    done
+    printf "${YELLOW}🎯 UI should show: %s${RESET}\n" "${ACTUAL:-error}"
+}
+
+# detect_vpn_client_mtu: Checks if router is acting as a VPN client, sources MTU, performs detection via WAN, and applies if confirmed.
+detect_vpn_client_mtu() {
+    printf "\n${CYAN}--- Detect VPN Client MTU ---${RESET}\n"
+    
+    # Source MTU from route_policy
+    VPN_CLIENT_MTU=$(uci get route_policy.@rule[0].mtu 2>/dev/null || grep "option mtu" /etc/config/route_policy | awk '{print $3}' | tr -d "'" | head -n 1 || echo "1420")
+    printf "Sourced VPN client MTU from route_policy: %s\n" "$VPN_CLIENT_MTU"
+    
+    # Check for active VPN client interfaces (wg0 for WireGuard, tun0 for OpenVPN)
+    WG_CLIENT_ACTIVE=0
+    OVPN_CLIENT_ACTIVE=0
+    WG_CLIENT_IF="wg0"
+    OVPN_CLIENT_IF="tun0"
+    
+    if [ -d "/sys/class/net/$WG_CLIENT_IF" ] && ip link show "$WG_CLIENT_IF" | grep -q "UP" && command -v wg >/dev/null 2>&1 && wg show "$WG_CLIENT_IF" | grep -q "latest handshake"; then
+        WG_CLIENT_ACTIVE=1
+        WG_PEER_IP=$(wg show "$WG_CLIENT_IF" | grep -A 1 "peer" | grep "endpoint" | awk '{print $2}' | cut -d':' -f1)
+    fi
+    if [ -d "/sys/class/net/$OVPN_CLIENT_IF" ] && ip link show "$OVPN_CLIENT_IF" | grep -q "UP" && [ -f /var/run/openvpn-client.status ] && grep -q "Connected" /var/run/openvpn-client.status; then
+        OVPN_CLIENT_ACTIVE=1
+        OVPN_PEER_IP=$(grep "Connected" /var/run/openvpn-client.status | awk '{print $2}' | head -n 1)
+    fi
+
+    if [ "$WG_CLIENT_ACTIVE" -eq 0 ] && [ "$OVPN_CLIENT_ACTIVE" -eq 0 ]; then
+        printf "${YELLOW}No active VPN client interfaces (WireGuard: %s, OpenVPN: %s). Returning to menu.${RESET}\n" "$WG_CLIENT_IF" "$OVPN_CLIENT_IF"
+        return
+    fi
+
+    # Detect MTU via WAN
+    TARGET="8.8.8.8"
+    printf "Testing MTU with target: %s via WAN (%s)\n" "$TARGET" "$WAN_IF"
+    MIN=1280
+    MAX=1500
+    STEP=4
+    LAST_GOOD=$MIN
+
+    for SIZE in $(seq $MIN $STEP $MAX); do
+        if ping -I "$WAN_IF" -c 1 -s $((SIZE - 28)) "$TARGET" >/dev/null 2>&1; then
+            LAST_GOOD=$SIZE
+        else
+            break
+        fi
+    done
+
+    RECOMMENDED=$LAST_GOOD
+    printf "${GREEN}Recommended WAN MTU: %d${RESET}\n" "$RECOMMENDED"
+    if [ "$RECOMMENDED" != "$VPN_CLIENT_MTU" ]; then
+        printf "Detected MTU differs from current VPN client MTU (%s).\n" "$VPN_CLIENT_MTU"
+        printf "Apply new MTU %d to VPN clients? [y/N]: " "$RECOMMENDED"
+        read ans
+        case "$ans" in
+            [Yy]*)
+                uci set route_policy.@rule[0].mtu="$RECOMMENDED"
+                uci commit route_policy
+                if [ "$WG_CLIENT_ACTIVE" -eq 1 ]; then
+                    ip link set "$WG_CLIENT_IF" mtu "$RECOMMENDED"
+                    uci set wireguard_client."$WG_CLIENT_IF".mtu="$RECOMMENDED" 2>/dev/null || printf "${YELLOW}⚠️ No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$WG_CLIENT_IF"
+                    uci commit wireguard_client
+                    /etc/init.d/wireguard restart
+                    printf "${GREEN}✓ WireGuard client (%s) set to MTU %s${RESET}\n" "$WG_CLIENT_IF" "$RECOMMENDED"
+                    printf "Verified MTU: %s\n" "$(get_mtu "$WG_CLIENT_IF")"
+                fi
+                if [ "$OVPN_CLIENT_ACTIVE" -eq 1 ]; then
+                    ip link set "$OVPN_CLIENT_IF" mtu "$RECOMMENDED"
+                    uci set ovpnclient.global.mtu="$RECOMMENDED" 2>/dev/null || printf "${YELLOW}⚠️ No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$OVPN_CLIENT_IF"
+                    uci commit ovpnclient
+                    /etc/init.d/openvpn restart
+                    printf "${GREEN}✓ OpenVPN client (%s) set to MTU %s${RESET}\n" "$OVPN_CLIENT_IF" "$RECOMMENDED"
+                    printf "Verified MTU: %s\n" "$(get_mtu "$OVPN_CLIENT_IF")"
+                fi
+                ;;
+            *) printf "Skipped applying MTU.\n" ;;
+        esac
+    else
+        printf "${GREEN}VPN client MTU already optimal (%s).${RESET}\n" "$VPN_CLIENT_MTU"
+    fi
+}
+
+detect_ip() { ip -4 addr show "$1" 2>/dev/null | grep inet | awk '{print $2}' | cut -d'/' -f1; }
+
+PUB_IP_CACHE=""
+external_ip() {
+    [ -n "$PUB_IP_CACHE" ] && { echo "$PUB_IP_CACHE"; return; }
+    if command -v wget >/dev/null 2>&1; then
+        PUB_IP_CACHE=$(wget -qO- https://api.ipify.org 2>/dev/null)
+    elif command -v curl >/dev/null 2>&1; then
+        PUB_IP_CACHE=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null)
+    else
+        PUB_IP_CACHE="Unavailable"
+    fi
+    echo "$PUB_IP_CACHE"
+}
+
+# Diagnostics
+run_diagnostics() {
+    printf "\n${CYAN}--- Network Diagnostics ---${RESET}\n\n"
+    printf "${CYAN}Default route:${RESET}\n"
+    ip route show default || printf "(none)\n"
+    printf "\n"
+    list_interfaces "yes" "yes" "yes"
+    printf "\n"
+    LAN_IP=$(detect_ip br-lan); WAN_IP=$(detect_ip "$WAN_IF")
+    OVPN_IP=$(detect_ip ovpnserver); WG_IP=$(detect_ip wgserver)
+    PUB_IP=$(external_ip)
+    printf "LAN IP:      ${YELLOW}%s${RESET}\n" "${LAN_IP:-Unavailable}"
+    printf "WAN IP:      ${YELLOW}%s${RESET}\n" "${WAN_IP:-Unavailable}"
+    printf "OpenVPN IP:  ${YELLOW}%s${RESET}\n" "${OVPN_IP:-Inactive}"
+    printf "WireGuard IP:${YELLOW}%s${RESET}\n" "${WG_IP:-Inactive}"
+    printf "Public IP:   ${YELLOW}%s${RESET}\n" "${PUB_IP:-Unavailable}"
+    printf "\n${CYAN}VPN Server Status:${RESET}\n"
+    if command -v wg >/dev/null 2>&1; then
+        WG_CLIENT_IP=$(detect_vpn_client "$WG_IF" "10.1.0.2" "wireguard" "yes")
+        if echo "$WG_CLIENT_IP" | grep -q ":unresponsive"; then
+            printf "${YELLOW}WireGuard server: No active clients${RESET}\n"
+        else
+            # Check for recent handshake (within 10 seconds)
+            WG_HANDSHAKE=$(wg show wgserver | grep "latest handshake" | awk '{print $3,$4}' | tr -d ',')
+            if [ -n "$WG_HANDSHAKE" ]; then
+                HANDSHAKE_SECONDS=$(echo "$WG_HANDSHAKE" | awk '{if ($2 == "second" || $2 == "seconds") print $1; else if ($2 == "minute" || $2 == "minutes") print $1*60; else print 9999}')
+                if [ "$HANDSHAKE_SECONDS" -le 10 ] && ping -I "$WG_IF" -c 1 -W 1 -s 949 "$WG_CLIENT_IP" >/dev/null 2>&1; then
+                    printf "${GREEN}WireGuard server: Active (clients connected)${RESET}\n"
+                else
+                    printf "${YELLOW}WireGuard server: No active clients (stale or no handshake)${RESET}\n"
+                fi
+            else
+                printf "${YELLOW}WireGuard server: No active clients${RESET}\n"
+            fi
+        fi
+    else
+        printf "${YELLOW}WireGuard server: Not installed${RESET}\n"
+    fi
+    if [ -f /var/run/openvpn-server.status ] && grep -q "CLIENT_LIST" /var/run/openvpn-server.status; then
+        OVPN_CLIENT_IP=$(detect_vpn_client "$OVPN_IF" "10.8.0.2" "openvpn" "yes")
+        if echo "$OVPN_CLIENT_IP" | grep -q ":unresponsive"; then
+            printf "${YELLOW}OpenVPN server: No active clients${RESET}\n"
+        else
+            printf "${GREEN}OpenVPN server: Active (clients connected)${RESET}\n"
+        fi
+    else
+        printf "${YELLOW}OpenVPN server: No active clients${RESET}\n"
+    fi
+}
+
+# set_manual_mtu: Allows user to manually set MTU for a selected network interface.
+set_manual_mtu() {
+    printf "\n${CYAN}--- Set Manual MTU ---${RESET}\n"
+    list_interfaces "no" "yes" "no" "yes"
+    INTERFACES=$(echo "$INTERFACES" | sed 's/^ *//;s/ *$//')
+    COUNT=$(echo "$INTERFACES" | wc -w)
+    [ "$COUNT" -eq 0 ] && { printf "${RED}No valid interfaces found${RESET}\n"; return; }
+    printf "\nSelect an interface or 'a' to see all interfaces (1-%d, a): " "$COUNT"
+    read CHOICE
+    if [ "$CHOICE" = "a" ] || [ "$CHOICE" = "A" ]; then
+        printf "\n${CYAN}All Interfaces:${RESET}\n"
+        list_interfaces "no" "" "" "yes"
+        INTERFACES=$(echo "$INTERFACES" | sed 's/^ *//;s/ *$//')
+        COUNT=$(echo "$INTERFACES" | wc -w)
+        [ "$COUNT" -eq 0 ] && { printf "${RED}No valid interfaces found${RESET}\n"; return; }
+        printf "\nSelect an interface (1-%d): " "$COUNT"
+        read CHOICE
+    fi
+    if ! echo "$CHOICE" | grep -qE '^[0-9]+$' || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "$COUNT" ]; then
+        printf "${RED}Invalid interface selection${RESET}\n"
+        return
+    fi
+    IFACE=$(echo "$INTERFACES" | awk "{print \$${CHOICE}}")
+    [ -z "$IFACE" ] && { printf "${RED}Error selecting interface${RESET}\n"; return; }
+    printf "Enter MTU value (1280-1500): "
+    read MTU
+    if [ -n "$MTU" ] && echo "$MTU" | grep -qE '^[0-9]+$' && [ "$MTU" -ge 1280 ] && [ "$MTU" -le 1500 ]; then
+        apply_mtu "$IFACE" "$MTU"
+    else
+        printf "${RED}Invalid MTU value (must be 1280-1500)${RESET}\n"
+    fi
+}
+
+# detect_mtu: Detects optimal MTU for WAN, WireGuard server, or OpenVPN server.
+detect_mtu() {
+    MODE="$1"
+    case "$MODE" in
+        wan)
+            IFACE="$WAN_IF"
+            OFFSET=0
+            NAME="WAN"
+            ;;
+        wireguard)
+            IFACE="$WG_IF"
+            OFFSET=80
+            NAME="WireGuard Server"
+            ;;
+        openvpn)
+            IFACE="$OVPN_IF"
+            OFFSET=72
+            NAME="OpenVPN Server"
+            ;;
+        *)
+            printf "${RED}Error: invalid mode '%s'${RESET}\n" "$MODE"
+            return 1
+            ;;
+    esac
+
+    if [ -z "$IFACE" ] || ! ip link show "$IFACE" >/dev/null 2>&1; then
+        printf "${YELLOW}Interface for %s not found.${RESET}\n" "$NAME"
+        return 1
+    fi
+
+    printf "\n${CYAN}--- Detect MTU for %s ---${RESET}\n" "$NAME"
+    CUR_MTU=$(get_mtu "$IFACE")
+    printf "Current MTU: %s\n" "${CUR_MTU:-unknown}"
+
+    if [ "$MODE" = "wan" ]; then
+        printf "Testing WAN MTU to 8.8.8.8...\n"
+        MIN=1280; MAX=1500; STEP=4; LAST_GOOD=$MIN
+        for SIZE in $(seq $MIN $STEP $MAX); do
+            ping -I "$IFACE" -c 1 -s $((SIZE - 28)) 8.8.8.8 >/dev/null 2>&1 && LAST_GOOD=$SIZE || break
+        done
+        RECOMMENDED=$LAST_GOOD
+    else
+        DEFAULT_IP=$( [ "$MODE" = "wireguard" ] && echo "10.1.0.2" || echo "10.8.0.2" )
+        printf "Scanning for client..."
+        CLIENT_IP=$(detect_vpn_client "$IFACE" "$DEFAULT_IP" "$MODE" "yes")
+        if echo "$CLIENT_IP" | grep -q ":unresponsive"; then
+            printf " none found\n"
+            RECOMMENDED=1420
+        else
+            printf " found %s\n" "$CLIENT_IP"
+            printf "Testing optimal MTU...\n"
+            RAW_MTU=$(test_mtu_vpn "$IFACE" "$CLIENT_IP" "$MODE" 2>/dev/null)
+            RECOMMENDED=$((RAW_MTU - OFFSET))
+            [ $RECOMMENDED -lt 1280 ] && RECOMMENDED=1280
+        fi
+    fi
+
+    if [ "$CUR_MTU" = "$RECOMMENDED" ]; then
+        printf "${GREEN}Recommended: %d (Already optimal)${RESET}\n" "$RECOMMENDED"
+    else
+        printf "${YELLOW}Recommended: %d (apply -%d overhead)${RESET}\n" "$RECOMMENDED" "$OFFSET"
+        printf "Apply new MTU %d to %s? [y/N]: " "$RECOMMENDED" "$IFACE"
+        read ans
+        case "$ans" in [Yy]*) apply_mtu "$IFACE" "$RECOMMENDED" ;; *) printf "Skipped.\n" ;; esac
+    fi
+}
+
+# Menu
+while true; do
+    clear
+    printf "${CYAN}%s${RESET}\n" "$SPLASH"
+    printf "${CYAN}┌──────────────────────────────┐${RESET}\n"
+    printf "${CYAN}│    🧩 MTU Doctor Utility     │${RESET}\n"
+    printf "${CYAN}└──────────────────────────────┘${RESET}\n"
+    printf " 1) Show current MTU settings\n"
+    printf " 2) Detect optimal MTU (no VPN)\n"
+    printf " 3) Detect optimal MTU for WireGuard server\n"
+    printf " 4) Detect optimal MTU for OpenVPN server\n"
+    printf " 5) Detect optimal MTU for VPN clients\n"
+    printf " 6) Run diagnostics\n"
+    printf " 7) Set manual MTU\n"
+    printf " 8) Exit\n\n"
+    printf "Select an option: "; read opt
+
+    case "$opt" in
+        1) printf "\n${CYAN}--- Current MTU Settings ---${RESET}\n"
+           list_interfaces "no" "yes" "no"
+           printf "\nShow all interfaces or press Enter to return to menu: [y/enter] "
+           read ans
+           if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+               printf "\n${CYAN}--- All Interfaces ---${RESET}\n"
+               list_interfaces "no" "no" "no"
+               printf "\nPress Enter to return to menu... "
+               read _
+           fi
+           ;;
+        2) detect_mtu "wan"; printf "\nPress Enter to return to menu..."; read _ ;;
+        3) detect_mtu "wireguard"; printf "\nPress Enter to return to menu..."; read _ ;;
+        4) detect_mtu "openvpn"; printf "\nPress Enter to return to menu..."; read _ ;;
+        5) detect_vpn_client_mtu; printf "\nPress Enter to return to menu..."; read _ ;;
+        6) run_diagnostics
+           printf "\nShow all interfaces or press Enter to return to menu: [y/enter] "
+           read ans
+           if [ "$ans" = "y" ] || [ "$ans" = "Y" ]; then
+               printf "\n${CYAN}--- All Interfaces ---${RESET}\n"
+               list_interfaces "no" "no" "no"
+               printf "\nPress Enter to return to menu... "
+               read _
+           fi
+           ;;
+        7) set_manual_mtu; printf "\nPress Enter to return to menu... "; read _ ;;
+        8) exit 0 ;;
+        *) printf "${YELLOW}Invalid option.${RESET}\n"; sleep 1 ;;
+    esac
+done

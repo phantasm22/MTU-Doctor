@@ -359,27 +359,34 @@ detect_vpn_client_mtu() {
     VPN_CLIENT_MTU=$(uci get route_policy.@rule[0].mtu 2>/dev/null || grep "option mtu" /etc/config/route_policy | awk '{print $3}' | tr -d "'" | head -n 1 || echo "1420")
     printf "Sourced VPN client MTU from route_policy: %s\n" "$VPN_CLIENT_MTU"
     
-    # Check for active VPN client interfaces (wg0 for WireGuard, tun0 for OpenVPN)
-    WG_CLIENT_ACTIVE=0
-    OVPN_CLIENT_ACTIVE=0
-    WG_CLIENT_IF="wg0"
-    OVPN_CLIENT_IF="tun0"
-    
-    if [ -d "/sys/class/net/$WG_CLIENT_IF" ] && ip link show "$WG_CLIENT_IF" | grep -q "UP" && command -v wg >/dev/null 2>&1 && wg show "$WG_CLIENT_IF" | grep -q "latest handshake"; then
-        WG_CLIENT_ACTIVE=1
-        WG_PEER_IP=$(wg show "$WG_CLIENT_IF" | grep -A 1 "peer" | grep "endpoint" | awk '{print $2}' | cut -d':' -f1)
-    fi
-    if [ -d "/sys/class/net/$OVPN_CLIENT_IF" ] && ip link show "$OVPN_CLIENT_IF" | grep -q "UP" && [ -f /var/run/openvpn-client.status ] && grep -q "Connected" /var/run/openvpn-client.status; then
-        OVPN_CLIENT_ACTIVE=1
-        OVPN_PEER_IP=$(grep "Connected" /var/run/openvpn-client.status | awk '{print $2}' | head -n 1)
-    fi
+    # === DYNAMIC: Find active WireGuard client interface (wg0, wg1, ...) ===
+    WG_CLIENT_IF=""
+    for iface in $(ls /sys/class/net 2>/dev/null | grep '^wg[0-9]*$'); do
+        if [ -d "/sys/class/net/$iface" ] && ip link show "$iface" | grep -q "UP" && command -v wg >/dev/null 2>&1 && wg show "$iface" | grep -q "latest handshake"; then
+            WG_CLIENT_IF="$iface"
+            break
+        fi
+    done
 
-    if [ "$WG_CLIENT_ACTIVE" -eq 0 ] && [ "$OVPN_CLIENT_ACTIVE" -eq 0 ]; then
-        printf "${YELLOW}No active VPN client interfaces (WireGuard: %s, OpenVPN: %s). Returning to menu.${RESET}\n" "$WG_CLIENT_IF" "$OVPN_CLIENT_IF"
+    # === DYNAMIC: Find active OpenVPN client interface (ovpnclient1, ovpnclient2, ...) ===
+    OVPN_CLIENT_IF=""
+    for iface in $(ls /sys/class/net 2>/dev/null | grep '^ovpnclient[0-9]*$'); do
+        if [ -d "/sys/class/net/$iface" ] && ip link show "$iface" | grep -q "UP"; then
+            status_file="/var/run/openvpn-${iface}.status"
+            if [ -f "$status_file" ] && grep -q "Connected" "$status_file"; then
+                OVPN_CLIENT_IF="$iface"
+                break
+            fi
+        fi
+    done
+
+    # === Check if any active client found ===
+    if [ -z "$WG_CLIENT_IF" ] && [ -z "$OVPN_CLIENT_IF" ]; then
+        printf "${YELLOW}No active VPN client interfaces found. Returning to menu.${RESET}\n"
         return
     fi
 
-    # Detect MTU via WAN
+    # === Detect MTU via WAN ===
     TARGET="8.8.8.8"
     printf "Testing MTU with target: %s via WAN (%s)\n" "$TARGET" "$WAN_IF"
     MIN=1280
@@ -397,6 +404,7 @@ detect_vpn_client_mtu() {
 
     RECOMMENDED=$LAST_GOOD
     printf "${GREEN}Recommended WAN MTU: %d${RESET}\n" "$RECOMMENDED"
+
     if [ "$RECOMMENDED" != "$VPN_CLIENT_MTU" ]; then
         printf "Detected MTU differs from current VPN client MTU (%s).\n" "$VPN_CLIENT_MTU"
         printf "Apply new MTU %d to VPN clients? [y/N]: " "$RECOMMENDED"
@@ -405,7 +413,7 @@ detect_vpn_client_mtu() {
             [Yy]*)
                 uci set route_policy.@rule[0].mtu="$RECOMMENDED"
                 uci commit route_policy
-                if [ "$WG_CLIENT_ACTIVE" -eq 1 ]; then
+                if [ -n "$WG_CLIENT_IF" ]; then
                     ip link set "$WG_CLIENT_IF" mtu "$RECOMMENDED"
                     uci set wireguard_client."$WG_CLIENT_IF".mtu="$RECOMMENDED" 2>/dev/null || printf "${YELLOW}No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$WG_CLIENT_IF"
                     uci commit wireguard_client
@@ -413,7 +421,7 @@ detect_vpn_client_mtu() {
                     printf "${GREEN}WireGuard client (%s) set to MTU %s${RESET}\n" "$WG_CLIENT_IF" "$RECOMMENDED"
                     printf "Verified MTU: %s\n" "$(get_mtu "$WG_CLIENT_IF")"
                 fi
-                if [ "$OVPN_CLIENT_ACTIVE" -eq 1 ]; then
+                if [ -n "$OVPN_CLIENT_IF" ]; then
                     ip link set "$OVPN_CLIENT_IF" mtu "$RECOMMENDED"
                     uci set ovpnclient.global.mtu="$RECOMMENDED" 2>/dev/null || printf "${YELLOW}No UCI mapping for %s, MTU set at runtime only${RESET}\n" "$OVPN_CLIENT_IF"
                     uci commit ovpnclient
@@ -600,7 +608,7 @@ while true; do
     printf "${CYAN}%s${RESET}\n" "$SPLASH"
     printf "${CYAN}┌──────────────────────────────┐${RESET}\n"
     printf "${CYAN}│    🧩 MTU Doctor Utility     │${RESET}\n"
-    printf "${CYAN}└──────────────???????????????????????????????????????????????????${RESET}\n"
+    printf "${CYAN}└──────────────────────────────┘${RESET}\n"
     printf " 1) Show current MTU settings\n"
     printf " 2) Detect optimal MTU (no VPN)\n"
     printf " 3) Detect optimal MTU for WireGuard server\n"

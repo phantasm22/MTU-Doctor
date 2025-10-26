@@ -231,7 +231,7 @@ test_mtu_vpn() {
     orig_mtu=$(get_mtu "$interface")
     [ -z "$orig_mtu" ] && orig_mtu=1400
 
-    printf "${MAGENTA}Testing max path MTU to %s...${RESET}\n" "$target_ip" >&2
+    printf "${MAGENTA}Testing max network MTU to %s...${RESET}\n" "$target_ip" >&2
 
     # Temp raise to 1500
     ip link set "$interface" mtu 1500 2>/dev/null || true
@@ -311,7 +311,7 @@ apply_mtu() {
     IFACE="$1"; VALUE="$2"
     
     if ip link set "$IFACE" mtu "$VALUE" 2>/dev/null; then
-        printf "${GREEN}MTU on %s set to %s${RESET}\n" "$IFACE" "$VALUE"
+        printf "${GREEN}🎯 MTU on %s set to %s${RESET}\n" "$IFACE" "$VALUE"
     else
         printf "${RED}Failed to set MTU on %s to %s${RESET}\n" "$IFACE" "$VALUE"
         return
@@ -376,7 +376,7 @@ apply_mtu() {
 detect_vpn_client_mtu() {
     printf "\n${CYAN}--- Detect VPN Client MTU ---${RESET}\n"
     
-    # === DYNAMIC: Find active WireGuard client interface (wg0, wg1, ...) ===
+    # === Find active client ===
     WG_CLIENT_IF=""
     for iface in $(ls /sys/class/net 2>/dev/null | grep '^wg[0-9]*$'); do
         if [ -d "/sys/class/net/$iface" ] && ip link show "$iface" | grep -q "UP" && command -v wg >/dev/null 2>&1 && wg show "$iface" | grep -q "latest handshake"; then
@@ -385,7 +385,6 @@ detect_vpn_client_mtu() {
         fi
     done
 
-    # === DYNAMIC: Find active OpenVPN client interface (ovpnclient1, ovpnclient2, ...) ===
     OVPN_CLIENT_IF=""
     for iface in $(ls /sys/class/net 2>/dev/null | grep '^ovpnclient[0-9]*$'); do
         if [ -d "/sys/class/net/$iface" ] && ip link show "$iface" | grep -q "UP"; then
@@ -397,60 +396,36 @@ detect_vpn_client_mtu() {
         fi
     done
 
-    # === Check if any active client found ===
     if [ -z "$OVPN_CLIENT_IF" ] && [ -z "$WG_CLIENT_IF" ]; then
-        printf "${YELLOW}No active VPN client interfaces found. Returning to menu.${RESET}\n"
+        printf "${YELLOW}No active VPN client found.${RESET}\n"
         return
     fi
 
-    # === Use test_mtu_vpn() to get recommended MTU via tunnel ===
-    if [ -n "$OVPN_CLIENT_IF" ]; then
-        printf "Testing OpenVPN client MTU via %s...\n" "$OVPN_CLIENT_IF"
-        PEER_IP=$(detect_vpn_peer_ip "$OVPN_CLIENT_IF")    
-        RECOMMENDED=$(test_mtu_vpn "$OVPN_CLIENT_IF" "$PEER_IP")
-    elif [ -n "$WG_CLIENT_IF" ]; then
-        printf "Testing WireGuard client MTU via %s...\n" "$WG_CLIENT_IF"
-        PEER_IP=$(detect_vpn_peer_ip "$WG_CLIENT_IF")
-        RECOMMENDED=$(test_mtu_vpn "$WG_CLIENT_IF" "$PEER_IP")
+    IFACE="${OVPN_CLIENT_IF:-$WG_CLIENT_IF}"
+    CUR_MTU=$(get_mtu "$IFACE")
+    printf "Current MTU: %s\n" "${CUR_MTU:-unknown}"
+
+    PEER_IP=$(detect_vpn_peer_ip "$IFACE")
+    if [ -z "$PEER_IP" ]; then
+        printf "${RED}Cannot detect peer IP. Skipping.${RESET}\n"
+        return
+    fi
+
+    RECOMMENDED=$(test_mtu_vpn "$IFACE" "$PEER_IP")
+
+    if [ "$CUR_MTU" = "$RECOMMENDED" ]; then
+        printf "${GREEN}Recommended: %d (Already optimal)${RESET}\n" "$RECOMMENDED"
     else
-        printf "${YELLOW}No VPN client active. Skipping MTU test.${RESET}\n"
-        return
-    fi
-
-    # === Source current MTU from route_policy  ===
-    VPN_CLIENT_MTU=$(get_mtu "$OVPN_CLIENT_IF" || get_mtu "$WG_CLIENT_IF")
-    [ -z "$VPN_CLIENT_MTU" ] && [ -n "$OVPN_CLIENT_IF" ] && VPN_CLIENT_MTU=$(get_mtu "$OVPN_CLIENT_IF")
-    [ -z "$VPN_CLIENT_MTU" ] && [ -n "$WG_CLIENT_IF" ] && VPN_CLIENT_MTU=$(get_mtu "$WG_CLIENT_IF")
-    [ -z "$VPN_CLIENT_MTU" ] && VPN_CLIENT_MTU="1420"
-
-    # === Compare and apply if needed ===
-    if [ "$RECOMMENDED" != "$VPN_CLIENT_MTU" ]; then
-        printf "Detected MTU differs from current VPN client MTU (%s).\n" "$VPN_CLIENT_MTU"
-        printf "Apply new MTU %d to VPN clients? [y/N]: " "$RECOMMENDED"
+        printf "${YELLOW}Recommended: %d${RESET}\n" "$RECOMMENDED"
+        printf "Apply new MTU %d to %s? [y/N]: " "$RECOMMENDED" "$IFACE"
         read ans
         case "$ans" in
             [Yy]*)
-                # Apply to route_policy (Web UI)
-                uci set route_policy.@rule[0].mtu="$RECOMMENDED"
-                uci commit route_policy
-
-                # Apply to interface
-                if [ -n "$OVPN_CLIENT_IF" ]; then
-                    ip link set "$OVPN_CLIENT_IF" mtu "$RECOMMENDED"
-                    /etc/init.d/openvpn restart
-                    printf "OpenVPN client (%s) set to MTU %s\n" "$OVPN_CLIENT_IF" "$RECOMMENDED"
-                fi
-                if [ -n "$WG_CLIENT_IF" ]; then
-                    ip link set "$WG_CLIENT_IF" mtu "$RECOMMENDED"
-                    /etc/init.d/wireguard restart 2>/dev/null || /etc/init.d/network restart
-                    printf "${GREEN}WireGuard client (%s) set to MTU %s${RESET}\n" "$WG_CLIENT_IF" "$RECOMMENDED"
-                fi
-                printf "🎯 Verified MTU: %s\n" "$(get_mtu "$OVPN_CLIENT_IF" || get_mtu "$WG_CLIENT_IF")"
+                ip link set "$IFACE" mtu "$RECOMMENDED"
+                printf "${GREEN}🎯 MTU on %s set to %d${RESET}\n" "$IFACE" "$RECOMMENDED"
                 ;;
-            *) printf "Skipped applying MTU.\n" ;;
+            *) printf "Skipped.\n" ;;
         esac
-    else
-        printf "${GREEN}VPN client MTU already optimal (%s).${RESET}\n" "$VPN_CLIENT_MTU"
     fi
 }
 
@@ -599,7 +574,6 @@ detect_mtu() {
             RECOMMENDED=1420
         else
             printf " found %s\n" "$CLIENT_IP"
-            printf "Testing optimal MTU...\n"
             RAW_MTU=$(test_mtu_vpn "$IFACE" "$CLIENT_IP")
             RECOMMENDED=$RAW_MTU
             [ $RECOMMENDED -lt 1280 ] && RECOMMENDED=1280

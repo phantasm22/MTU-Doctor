@@ -23,7 +23,7 @@ Automated MTU discovery, testing & optimization for WAN, WireGuard, and OpenVPN 
 ## 📥 Install
 
 ~~~sh
-wget -O mtu_doctor.sh https://raw.githubusercontent.com/phantasm22/mtu_doctor/main/mtu_doctor.sh && chmod +x mtu_doctor.sh
+wget -O mtu_doctor.sh https://raw.githubusercontent.com/phantasm22/MTU-Doctor/main/mtu_doctor.sh && chmod +x mtu_doctor.sh
 ~~~
 
 Run:
